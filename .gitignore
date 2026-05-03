@@ -1,0 +1,32 @@
+node_modules/
+.claude/
+
+# User secrets — never commit these
+div_config.json
+litellm_config.yaml
+divai.crt
+divai.key
+.env
+
+# User-specific runtime data
+div_memory.json
+div_persona.txt
+div_knowt_cache.json
+div_fiveable_cache.json
+.knowt_session/
+.fiveable_session/
+
+# Voice model download
+vosk-model*/
+
+# Personal session summaries and investigation notes (local only)
+sessions/
+
+# Temp audio files
+temp_tts*.mp3
+temp_voice.wav
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo

@@ -1,0 +1,31 @@
+{
+    "_comment": "Copy to div_config.json and fill in your keys, OR run: python div_onboard.py",
+    "whisper_key": "_comment: Groq key used for voice transcription — get at console.groq.com/keys",
+    "models": {
+        "talk": {
+            "_comment": "Local Ollama — free, private. Install from ollama.com then: ollama pull qwen3:8b",
+            "model": "ollama/qwen3:8b",
+            "key": "",
+            "api_base": "http://localhost:11434"
+        },
+        "code": {
+            "_comment": "GitHub PAT — free at github.com/settings/tokens (needs Models Read scope)",
+            "model": "github/gpt-4o",
+            "key": ""
+        },
+        "brain": {
+            "_comment": "DeepSeek — platform.deepseek.com/api_keys",
+            "model": "deepseek/deepseek-reasoner",
+            "key": ""
+        },
+        "full": {
+            "_comment": "OpenAI — platform.openai.com/api-keys",
+            "model": "openai/gpt-4o",
+            "key": ""
+        }
+    },
+    "vault": "",
+    "canvas_url": "",
+    "canvas_token": "",
+    "last_briefing": ""
+}

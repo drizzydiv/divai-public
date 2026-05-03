@@ -1,0 +1,19 @@
+# divAI LiteLLM Proxy Config Template
+# Copy to litellm_config.yaml and fill in your keys,
+# OR run: python div_onboard.py  (it generates this file automatically)
+
+model_list:
+  # Fast, free chat — get key at console.groq.com/keys
+  - model_name: "divtalk"
+    litellm_params:
+      model: "groq/llama-3.1-8b-instant"
+      api_key: ""   # paste your gsk_... key here
+
+  # Deep reasoning — get key at platform.deepseek.com/api_keys
+  - model_name: "divbrain"
+    litellm_params:
+      model: "deepseek/deepseek-reasoner"
+      api_key: ""   # paste your sk-... key here
+
+litellm_settings:
+  drop_params: true
