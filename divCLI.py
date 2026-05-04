@@ -8,6 +8,13 @@ import itertools
 import threading
 import time
 from datetime import datetime, timezone, timedelta, date as _date
+
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
 def completion(*args, **kwargs):
     from litellm import completion as _c
     return _c(*args, **kwargs)
@@ -56,10 +63,10 @@ PERSONA_FILE = os.path.join(CLI_DIR, "div_persona.txt")
 MEMORY_FILE = os.path.join(CLI_DIR, "div_memory.json")
 
 DEFAULT_MODELS = {
-    "talk":  {"model": "groq/llama-3.3-70b-versatile",  "key": ""},
-    "code":  {"model": "github/gpt-4o",                  "key": ""},
-    "brain": {"model": "deepseek/deepseek-reasoner",     "key": ""},
-    "full":  {"model": "openai/gpt-4o",                  "key": ""},
+    "talk":  {"model": "openai/gpt-4o-mini", "key": ""},
+    "code":  {"model": "openai/gpt-4.1",     "key": ""},
+    "brain": {"model": "openai/gpt-5.4",     "key": ""},
+    "full":  {"model": "openai/gpt-4.1",     "key": ""},
 }
 
 # Launch onboarding wizard on first run (no config or no keys set)
@@ -110,6 +117,30 @@ def save_config():
                    "canvas_token": CANVAS_TOKEN, "last_briefing": LAST_BRIEFING,
                    "last_session_at": LAST_SESSION_AT, "whisper_key": WHISPER_KEY,
                    "tts_voice": TTS_VOICE, "tts_rate": TTS_RATE}, f, indent=4)
+
+# Auto-migrate stale model names to current defaults.
+# Catches old providers (groq/deepseek/github) AND previous OpenAI defaults.
+_STALE_MODELS = {
+    "talk":  {"groq/llama-3.3-70b-versatile"},
+    "code":  {"github/gpt-4o", "openai/gpt-4o", "openai/gpt-4"},
+    "brain": {"deepseek/deepseek-reasoner", "openai/o4-mini", "openai/gpt-4o"},
+    "full":  {"github/gpt-4o", "openai/gpt-4o"},
+}
+_TARGET_MODELS = {
+    "talk":  "openai/gpt-4o-mini",
+    "code":  "openai/gpt-4.1",
+    "brain": "openai/gpt-5.4",
+    "full":  "openai/gpt-4.1",
+}
+_openai_key = MODELS.get("full", {}).get("key", "")
+_migrated = False
+for _slot, _stale_set in _STALE_MODELS.items():
+    _m = MODELS.get(_slot, {}).get("model", "")
+    if _m in _stale_set or any(_m.startswith(p) for p in ("groq/", "deepseek/", "github/", "anthropic/")):
+        MODELS[_slot] = {"model": _TARGET_MODELS[_slot], "key": MODELS.get(_slot, {}).get("key", "") or _openai_key}
+        _migrated = True
+if _migrated:
+    save_config()
 
 # ── Session gap tracking ──
 _now_dt = datetime.now()
@@ -180,8 +211,9 @@ def _trim_messages(msgs, keep=30):
 
 def route_message(text: str) -> str:
     t = text.lower()
-    has_code  = bool(MODELS.get("code",  {}).get("key"))
-    has_brain = bool(MODELS.get("brain", {}).get("key"))
+    _shared = MODELS.get("full", {}).get("key", "")
+    has_code  = bool(MODELS.get("code",  {}).get("key") or _shared)
+    has_brain = bool(MODELS.get("brain", {}).get("key") or _shared)
     # Explicit programming task → code model
     if has_code and any(kw in t for kw in [
         "code", "script", "function", "class", "debug", "bug", "error",
@@ -705,77 +737,33 @@ def strip_for_speech(text):
     text = re.sub(r'^\s*[-*•]\s+', '', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
     text = re.sub(r'\n{3,}', '\n\n', text)
+    # strip punctuation that causes long TTS pauses
+    text = re.sub(r'[,;:]', '', text)
+    text = re.sub(r'[—–]', ' ', text)
     return text.strip()
 
 def speak(text):
-    speech_text = strip_for_speech(text)
-    if not speech_text:
+    if not text or not text.strip():
         return
-    if len(speech_text) > 1500:
-        speech_text = speech_text[:1500] + "..."
 
+    # edge-tts via src/voice/tts.py — free, no API key, Microsoft Neural voices
     try:
-        import edge_tts
-    except ImportError:
-        subprocess.run([sys.executable, "-m", "pip", "install", "edge-tts"], capture_output=True)
-        try:
-            import edge_tts
-        except Exception:
-            return
-
-    try:
-        import asyncio, queue as _q, ctypes
-        winmm = ctypes.windll.winmm
-
-        # Split into sentences so we start playing the first one immediately
-        # while the rest are generated in parallel (producer-consumer pipeline)
-        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', speech_text) if len(s.strip()) > 3]
-        if not sentences:
-            sentences = [speech_text]
-
-        audio_q = _q.Queue(maxsize=3)
-
-        async def _gen():
-            for s in sentences:
-                data = b""
-                async for chunk in edge_tts.Communicate(s, TTS_VOICE, rate=TTS_RATE).stream():
-                    if chunk["type"] == "audio":
-                        data += chunk["data"]
-                audio_q.put(data)
-            audio_q.put(None)
-
-        def _producer():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(_gen())
-            finally:
-                loop.close()
-
-        threading.Thread(target=_producer, daemon=True).start()
-
-        slot = 0
-        while True:
-            data = audio_q.get()
-            if data is None:
-                break
-            tmp = os.path.join(CLI_DIR, f"temp_tts_{slot}.mp3")
-            with open(tmp, "wb") as f:
-                f.write(data)
-            alias = f"div_tts_{slot}"
-            winmm.mciSendStringW(f'open "{tmp}" type mpegvideo alias {alias}', None, 0, None)
-            winmm.mciSendStringW(f'play {alias} wait', None, 0, None)
-            winmm.mciSendStringW(f'close {alias}', None, 0, None)
-            slot = 1 - slot
+        import pathlib as _pl
+        _vdir = str(_pl.Path(__file__).parent)
+        if _vdir not in sys.path:
+            sys.path.insert(0, _vdir)
+        from src.voice.tts import speak as _tts_speak
+        _tts_speak(text, voice=TTS_VOICE, rate=TTS_RATE)
         return
     except Exception:
         pass
 
+    # pyttsx3 last resort
     try:
         import pyttsx3
         engine = pyttsx3.init()
         engine.setProperty("rate", 220)
-        engine.say(speech_text)
+        engine.say(strip_for_speech(text)[:1500])
         engine.runAndWait()
     except Exception:
         pass
@@ -939,7 +927,111 @@ You have LIVE access to Fiveable and Knowt content via your tools. NEVER say you
 - Use search_web("site:knowt.com {topic}") for Knowt flashcard sets specifically.
 You are an active study assistant — go get the content, don't wait to be asked twice.
 
-[TTS] This CLI has text-to-speech output. When TTS is active, your responses are spoken aloud via Microsoft Neural voices. Never say you cannot output voice or sound — you can. Respond naturally; do not break the fourth wall about your environment."""
+[TTS] This CLI has text-to-speech output. When TTS is active, your responses are spoken aloud via Microsoft Neural voices. Never say you cannot output voice or sound — you can. Respond naturally; do not break the fourth wall about your environment.
+
+[DIVAI SELF-AWARENESS — YOUR OWN CAPABILITIES]
+You ARE divAI. You run as a Python CLI (divCLI.py). When the user asks what you can do, how to use a command, or what a feature is, answer from this exact list — do not guess or make things up.
+
+MODELS & ROUTING
+- /auto       — Default. Auto-routes each message to the best model: talk (gpt-4o-mini, fast/cheap), code (gpt-4.1, programming), brain (gpt-5.4, deep reasoning). Routing is keyword-based. All three use the same OpenAI key.
+- /talk        — Pin to gpt-4o-mini (fastest, cheapest)
+- /code        — Pin to gpt-4.1 (best for coding tasks)
+- /brain       — Pin to gpt-5.4 (most capable — best for analysis, essays, planning)
+- /divfull     — Pin to gpt-4.1 (same as /code, explicit full-power mode)
+
+VOICE & TTS
+- /v (or /voice) — Push-to-talk voice input. Records mic until ENTER, transcribes via Groq Whisper, sends as your prompt.
+- /speak         — Toggle text-to-speech output on/off. Reads bot replies aloud using Microsoft Neural TTS (edge-tts).
+- /speak-voice <name> — Change TTS voice, e.g. /speak-voice en-US-JennyNeural. Default: en-US-AndrewNeural.
+- /speak-rate <rate>  — Set speech speed, e.g. /speak-rate +50% for faster, /speak-rate -10% for slower. Blank to check current.
+
+SESSION
+- /clear   — Wipe the conversation history and start fresh (keeps config/keys).
+- /restart — Fully restart divAI (re-runs the script).
+- /exit    — Exit. If a vault is linked, auto-logs the session to divAI_Session_Logs.md.
+
+CONFIG
+- /key openai <api_key>    — Set OpenAI key for all slots at once. This is all you need.
+- /key <engine> <api_key>  — Set key for one slot. Engines: talk, code, brain, full, whisper.
+- /key whisper <groq_key>  — Set the Groq key used for voice transcription (/v).
+- /persona                  — Opens the system persona file in Notepad. Edit it to change your personality/instructions.
+- /vault <path>             — Link an Obsidian vault folder. Enables note reading/writing and session logging. Example: /vault D:\\MyVault
+
+REMINDERS
+- /remind <minutes> <message> — Sets a timed reminder. Fires a terminal bell + Windows toast notification. Example: /remind 30 submit CS homework
+- You (the AI) can also call set_reminder directly when the user asks for a reminder by time or duration.
+
+CANVAS (School LMS)
+- /canvas                        — Show cached upcoming assignments.
+- /canvas url <url>              — Set Canvas school URL, e.g. /canvas url myschool.instructure.com
+- /canvas setup <token>          — Connect Canvas with an API token (Canvas → Account → Settings → New Access Token).
+- /canvas setup <url> <token>    — Set URL and token in one step.
+- You (the AI) can call get_canvas_overview, get_canvas_assignments, and canvas_api for live data.
+
+KNOWT (Flashcard study scheduler)
+- /knowt         — Show cached Knowt study schedule (upcoming exams, flashcard progress).
+- /knowt setup   — Opens a browser to log into Knowt via Playwright scraping (no official API).
+- /knowt sync    — Re-scrapes Knowt to refresh the schedule.
+
+FIVEABLE (AP study guides)
+- /fiveable         — Show cached AP exam progress.
+- /fiveable setup   — Opens a browser to log into Fiveable.
+- /fiveable sync    — Re-scrapes Fiveable AP data.
+- You (the AI) can call search_fiveable or fetch_url to pull live Fiveable study content instantly.
+
+OSINT INVESTIGATION MODULE
+- investigate <case name>            — Full investigation (missing persons): Wikipedia, Reddit, NamUs, Charley Project, news, Wayback CDX
+- investigate <case name> --refresh  — Force re-scrape
+- show contradictions                — Interactive review of contradictions from last investigation
+- show leads                         — Display priority lead queue (Tier 1/2/3)
+- read investigation brief           — Speak/display the investigation summary
+- narrate [case name]                — Cinematic narrative brief: hook, contradiction, leads, voiceover
+
+PROFILE COMMAND — for living people (social media, public records, username correlation)
+Syntax: profile <name> [hints] [--refresh]
+
+Hints narrow the search and are CRITICAL for non-famous people with common names:
+  --location "City, ST"    Narrows people-aggregator and social queries by geography
+  --username handle         Enables Sherlock (checks 300+ sites for that username) — most powerful hint
+  --company "Employer"      Narrows LinkedIn and news queries by employer
+  --school "School Name"    Narrows for students/faculty (treated like company in searches)
+  --email addr@domain.com   Enables holehe (checks 120+ sites for email registration)
+  --refresh                 Re-scrapes all sources, ignores cache
+
+Examples:
+  profile John Smith
+  profile John Smith --location "Seattle, WA"
+  profile John Smith --username johnsmith92 --location "Austin, TX"
+  profile Divik Srivastava --school "FCHS" --username clippedby.div
+  profile Jane Doe --company "Amazon" --location "New York"
+  profile Jane Doe --email jane.doe@gmail.com
+
+REFINEMENT STRATEGY — when the user says they learned something new from a profile run (a school, a handle, a company), ALWAYS respond by showing them the exact refined command to run next. Do not give generic advice. Example: if a first run found school "FCHS" and Instagram handle "clippedby.div", the next command is:
+  profile Divik Srivastava --school "FCHS" --username clippedby.div
+Feed every new discovery back as a hint in the next profile call. Sherlock (--username) is the single most powerful tool — if you ever find a handle, immediately suggest running it with that hint.
+
+CONTEXT SYSTEM (force-load focused context from vault)
+- mode: coding   — Load coding-specific context
+- mode: school   — Load school/study context
+- mode: osint    — Load OSINT/research context
+- mode: channel  — Load channel context
+- mode: planning — Load planning context
+- context status      — Show which context modes are currently active
+- summarize session   — AI summarizes the current conversation and saves it to sessions/cli/
+
+BUILT-IN TOOLS (you call these automatically, user doesn't need to invoke them directly)
+- run_command(command)              — Runs a PowerShell command on the user's PC
+- read_file / write_file / edit_file / list_directory — Local filesystem access
+- search_web(query)                 — DuckDuckGo internet search
+- fetch_url(url)                    — Fetches and cleans any webpage
+- search_fiveable(topic)            — Searches Fiveable for AP study content
+- search_vault / read_vault_note / write_vault_note — Obsidian vault read/write
+- get_canvas_overview / get_canvas_assignments / canvas_api — Canvas LMS live data
+- get_knowt_schedule / get_fiveable_schedule — Study platform schedules
+- set_reminder(minutes, message)    — Timed reminder with toast notification
+- render_cell(cell_type, params)    — Opens a live GUI popup: timer, checklist, progress tracker, schedule, or table
+
+When the user asks "what can you do", "how do I use X", or "do you have a command for Y" — answer from the above list precisely."""
 
     now_str = datetime.now().strftime("%A, %B %#d %Y at %#I:%M %p")
     prompt = prompt.replace("{NOW}", now_str)
@@ -1052,7 +1144,19 @@ def print_header():
         print(f"\033[90m[KNOWT] {exams} upcoming exam(s) tracked\033[0m")
     print("\033[90m[COMMANDS] /help for full list  |  /talk /code /brain /divfull  |  /canvas /knowt /fiveable  |  /remind /v /clear /exit\033[0m\n")
 
-print_header()
+try:
+    from div_boot import boot_animation as _boot_animation
+    _boot_animation({
+        "models":          MODELS,
+        "vault":           GLOBAL_VAULT,
+        "canvas_url":      CANVAS_URL,
+        "canvas_cache":    _canvas_cache,
+        "knowt_cache":     _knowt_cache,
+        "fiveable_cache":  _fiveable_cache,
+        "current_mode":    current_mode,
+    })
+except Exception:
+    print_header()
 morning_briefing()
 
 # ==========================================
@@ -1155,10 +1259,10 @@ while True:
             cmds = [
                 ("MODELS",      None),
                 ("/auto",        "Auto-route each message to the best model (default)"),
-                ("/talk",        "Pin to Groq Llama (fast, free)"),
-                ("/code",        "Pin to GitHub GPT-4o (coding)"),
-                ("/brain",       "Pin to DeepSeek Reasoner (deep reasoning)"),
-                ("/divfull",     "Pin to OpenAI GPT-4o (full power)"),
+                ("/talk",        "Pin to gpt-4o-mini (fast, cheap)"),
+                ("/code",        "Pin to gpt-4.1 (coding)"),
+                ("/brain",       "Pin to gpt-5.4 (most capable)"),
+                ("/divfull",     "Pin to gpt-4.1 (full power)"),
                 ("",             None),
                 ("TOOLS",       None),
                 ("/v",           "Push-to-talk voice input (Groq Whisper)"),
@@ -1173,7 +1277,8 @@ while True:
                 ("/exit",        "Exit (auto-logs session to vault if linked)"),
                 ("",             None),
                 ("CONFIG",      None),
-                ("/key <engine> <key>",   f"Set API key  |  engines: {', '.join(MODELS.keys())}"),
+                ("/key openai <key>",     "Set OpenAI key for all slots at once (recommended)"),
+                ("/key <engine> <key>",   f"Set key for one slot  |  engines: {', '.join(MODELS.keys())}"),
                 ("/persona",     "Edit the system persona in Notepad"),
                 ("/vault <path>","Link Obsidian vault for notes + session logging"),
                 ("",             None),
@@ -1189,6 +1294,23 @@ while True:
                 ("/fiveable sync",       "Re-scrape Fiveable AP data"),
                 ("",             None),
                 ("/key whisper <groq_key>", "Set Groq key used for voice transcription"),
+                ("",             None),
+                ("OSINT",        None),
+                ("investigate <name>",         "Run full OSINT investigation on a case (missing persons)"),
+                ("investigate <name> --refresh","Re-scrape all sources and re-extract claims"),
+                ("show contradictions",         "Review contradictions from last investigation"),
+                ("show leads",                  "Show priority lead queue from last investigation"),
+                ("show leads tier 1",           "Show only Tier 1 leads"),
+                ("read investigation brief",    "Speak/display the investigation summary"),
+                ("narrate",                     "Generate cinematic narrative brief from last investigation"),
+                ("narrate <case name>",         "Generate narrative brief for a specific cached case"),
+                ("profile <name>",                        "Build public digital footprint (people aggregators, social, Sherlock, holehe)"),
+                ("profile <name> --location \"City, ST\"", "Narrow by geography"),
+                ("profile <name> --username handle",       "Enable Sherlock — checks 300+ sites for that username"),
+                ("profile <name> --school \"School\"",     "Narrow for students/faculty"),
+                ("profile <name> --company \"Co\"",        "Narrow by employer"),
+                ("profile <name> --email addr",            "Enable holehe — checks 120+ sites for email"),
+                ("profile <name> --refresh",               "Re-scrape all sources"),
                 ("",             None),
                 ("CONTEXT SYSTEM", None),
                 ("mode: osint",   "Force-load OSINT context into session"),
@@ -1245,8 +1367,13 @@ while True:
                     WHISPER_KEY = new_key
                     save_config()
                     print(f"\033[92m  ⎿ Whisper (voice) key updated\033[0m\n")
+                elif engine == "openai":
+                    for _s in ("talk", "code", "brain", "full"):
+                        MODELS[_s]["key"] = new_key
+                    save_config()
+                    print(f"\033[92m  ⎿ OpenAI key set for all slots (talk / code / brain / full)\033[0m\n")
                 elif engine not in MODELS:
-                    print(f"\033[91m  ⎿ Unknown engine '{engine}'. Available: {engines}, whisper\033[0m\n")
+                    print(f"\033[91m  ⎿ Unknown engine '{engine}'. Available: {engines}, openai, whisper\033[0m\n")
                 else:
                     MODELS[engine]["key"] = new_key
                     save_config()
@@ -1438,6 +1565,216 @@ while True:
                     print(f"\033[92m  ⎿ TTS rate set to: {TTS_RATE}\033[0m\n")
             continue
 
+        # ── OSINT: investigate <case name> [--refresh] ──
+        if cmd_lower.startswith('investigate'):
+            _parts = user_input.split(None, 1)
+            _rest = _parts[1].strip() if len(_parts) > 1 else ""
+            _refresh_flag = "--refresh" in _rest
+            _case_name = _rest.replace("--refresh", "").strip()
+            if not _case_name:
+                print(f"\033[91m  ⎿ Usage: investigate <case name> [--refresh]\033[0m\n")
+                continue
+            try:
+                from div_osint import run_investigation as _run_osint
+                _shared_key = MODELS.get("full", {}).get("key", "")
+                _osint_slot = "brain" if (MODELS.get("brain", {}).get("key") or _shared_key) else "code"
+                _osint_model = MODELS.get(_osint_slot, MODELS.get("full", {}))
+                _osint_model_name = _osint_model.get("model", "")
+                _osint_key = _osint_model.get("key") or _shared_key
+                if _osint_key:
+                    os.environ["OPENAI_API_KEY"] = _osint_key
+                _run_osint(
+                    case_name=_case_name,
+                    cli_dir=CLI_DIR,
+                    completion_fn=completion,
+                    model=_osint_model_name,
+                    api_key=_osint_key or None,
+                    vault_path=GLOBAL_VAULT or None,
+                    refresh=_refresh_flag,
+                    speak_fn=speak if TTS_ENABLED else None,
+                )
+            except ImportError:
+                print(f"\033[91m  ⎿ OSINT module not found. Ensure div_osint.py is in the divAI directory.\033[0m\n")
+            except Exception as _e:
+                print(f"\033[91m  ⎿ Investigation error: {_e}\033[0m\n")
+            continue
+
+        # ── OSINT: show contradictions / show leads ──
+        if cmd_lower.startswith('show contradictions') or cmd_lower.startswith('show leads'):
+            try:
+                from div_osint import latest_cached_investigation as _osint_latest, interactive_contradiction_review as _osint_review
+                _latest = _osint_latest(CLI_DIR)
+                if not _latest:
+                    print(f"\033[91m  ⎿ No cached investigation. Run: investigate <case name>\033[0m\n")
+                    continue
+                _case = _latest.get("case_name", "Unknown")
+                if "contradictions" in cmd_lower:
+                    _contrs = _latest.get("contradictions", [])
+                    if not _contrs:
+                        print(f"\033[94m  ⎿ No contradictions found in: {_case}\033[0m\n")
+                    else:
+                        print(f"\n\033[93m⚠️  Contradictions for: {_case}\033[0m")
+                        _osint_review(_contrs)
+                else:
+                    _leads = _latest.get("leads", {})
+                    # optional tier filter: "show leads tier 1" → only tier1
+                    _tier_filter = None
+                    for _t in ("1", "2", "3"):
+                        if f"tier {_t}" in cmd_lower:
+                            _tier_filter = f"tier{_t}"
+                    print(f"\n\033[94m📋 Priority Leads for: {_case}\033[0m")
+                    for _tier, _tier_leads in _leads.items():
+                        if _tier_filter and _tier != _tier_filter:
+                            continue
+                        if _tier_leads:
+                            print(f"\n  {_tier.upper()}:")
+                            for _lead in _tier_leads:
+                                print(f"    {_lead.get('rank','')}. {_lead.get('title','')} — {_lead.get('osint_potential','')}")
+                    print()
+            except Exception as _e:
+                print(f"\033[91m  ⎿ Error: {_e}\033[0m\n")
+            continue
+
+        # ── OSINT: read investigation brief ──
+        if cmd_lower.startswith('read investigation') or cmd_lower == 'read investigation brief':
+            try:
+                from div_osint import latest_cached_investigation as _osint_latest
+                _latest = _osint_latest(CLI_DIR)
+                if not _latest:
+                    print(f"\033[91m  ⎿ No cached investigation. Run: investigate <case name>\033[0m\n")
+                    continue
+                _case = _latest.get("case_name", "Unknown")
+                _claims = _latest.get("claims", [])
+                _contrs = _latest.get("contradictions", [])
+                _leads = _latest.get("leads", {})
+                parts = [f"I found {len(_claims)} claims about {_case} across all public sources."]
+                if _contrs:
+                    parts.append(f"I detected {len(_contrs)} contradiction{'s' if len(_contrs)!=1 else ''} in the public record.")
+                    parts.append(f"The highest-priority is: {_contrs[0].get('topic','an unresolved discrepancy')}.")
+                if _leads.get("tier1"):
+                    parts.append(f"Top lead: {_leads['tier1'][0].get('title','')}.")
+                if GLOBAL_VAULT:
+                    parts.append(f"Full investigation files are in your Obsidian vault at /investigations/.")
+                _brief = " ".join(parts)
+                print(f"\n\033[94m●\033[0m\n{render_response(_brief)}\n")
+                speak(_brief)
+            except Exception as _e:
+                print(f"\033[91m  ⎿ Error: {_e}\033[0m\n")
+            continue
+
+        # ── Social Profile OSINT: profile <name> [--refresh] ──
+        if re.match(r'^profile(\s|$)', cmd_lower):
+            _parts = user_input.split(None, 1)
+            _raw_args = _parts[1].strip() if len(_parts) > 1 else ""
+            _refresh_flag = "--refresh" in _raw_args
+            _raw_args_clean = _raw_args.replace("--refresh", "").strip()
+            if not _raw_args_clean:
+                print(f"\033[91m  ⎿ Usage: profile <name> [--location \"City, ST\"] [--username handle] [--company \"Co\"] [--email addr]\033[0m\n")
+                continue
+            try:
+                from div_profile import run_profile as _run_profile, parse_profile_args as _parse_profile_args
+                _p_name, _p_hints = _parse_profile_args(_raw_args_clean)
+                if not _p_name:
+                    print(f"\033[91m  ⎿ Name required. Usage: profile <name> [--location \"City, ST\"] [--username handle]\033[0m\n")
+                    continue
+                _shared_key = MODELS.get("full", {}).get("key", "")
+                _p_slot = "brain" if (MODELS.get("brain", {}).get("key") or _shared_key) else "code"
+                _p_model = MODELS.get(_p_slot, MODELS.get("full", {}))
+                _p_key = _p_model.get("key") or _shared_key
+                if _p_key:
+                    os.environ["OPENAI_API_KEY"] = _p_key
+                _run_profile(
+                    name=_p_name,
+                    hints=_p_hints,
+                    cli_dir=CLI_DIR,
+                    completion_fn=completion,
+                    model=_p_model.get("model", ""),
+                    api_key=_p_key or None,
+                    vault_path=GLOBAL_VAULT or None,
+                    refresh=_refresh_flag,
+                    speak_fn=speak if TTS_ENABLED else None,
+                )
+            except ImportError:
+                print(f"\033[91m  ⎿ Profile module not found. Ensure div_profile.py is in the divAI directory.\033[0m\n")
+            except Exception as _e:
+                print(f"\033[91m  ⎿ Profile error: {_e}\033[0m\n")
+            continue
+
+        # ── OSINT: narrate [case name] ──
+        if cmd_lower == 'narrate' or cmd_lower.startswith('narrate '):
+            try:
+                from div_osint import (
+                    latest_cached_investigation as _osint_latest,
+                    load_cache as _osint_load,
+                    generate_narrative_brief as _osint_narrate,
+                    extract_voiceover as _osint_voiceover,
+                )
+                _parts = user_input.split(None, 1)
+                _narrate_case = _parts[1].strip() if len(_parts) > 1 else ""
+                _inv = _osint_load(CLI_DIR, _narrate_case) if _narrate_case else _osint_latest(CLI_DIR)
+                if not _inv:
+                    hint = f"investigate {_narrate_case}" if _narrate_case else "investigate <case name>"
+                    print(f"\033[91m  ⎿ No cached investigation{' for '+_narrate_case if _narrate_case else ''}. Run: {hint}\033[0m\n")
+                    continue
+                _case_display = _inv.get("case_name", _narrate_case or "Unknown")
+                print(f"\n\033[94m🎬 Generating narrative brief for: {_case_display}...\033[0m")
+                _sp = _start_spinner()
+                try:
+                    _shared_key = MODELS.get("full", {}).get("key", "")
+                    _n_slot = "brain" if (MODELS.get("brain", {}).get("key") or _shared_key) else "code"
+                    _n_model = MODELS.get(_n_slot, MODELS.get("full", {}))
+                    _n_model_name = _n_model.get("model", "")
+                    _n_key = _n_model.get("key") or _shared_key
+                    if _n_key:
+                        os.environ["OPENAI_API_KEY"] = _n_key
+                    _narrative = _osint_narrate(
+                        inv_data=_inv,
+                        completion_fn=completion,
+                        model=_n_model_name,
+                        api_key=_n_key or None,
+                    )
+                finally:
+                    _stop_spinner(_sp)
+                # ── Render narrative with section-aware coloring ──
+                _section_colors = {
+                    "🎬": "\033[94m",   # blue
+                    "⚠": "\033[93m",    # yellow
+                    "🔴": "\033[91m",   # red
+                    "🟡": "\033[93m",   # yellow
+                    "⚪": "\033[90m",   # gray
+                    "❓": "\033[96m",   # cyan
+                    "🎤": "\033[92m",   # green
+                }
+                print()
+                _in_content = False
+                for _line in _narrative.splitlines():
+                    _stripped = _line.strip()
+                    _matched_color = None
+                    for _emoji, _color in _section_colors.items():
+                        if _stripped.startswith(_emoji):
+                            _matched_color = _color
+                            break
+                    if _matched_color:
+                        print(f"\n{_matched_color}{_stripped}\033[0m")
+                        _in_content = True
+                    elif _stripped == "---":
+                        print(f"\033[90m{'─' * 44}\033[0m")
+                        _in_content = False
+                    elif _in_content and _stripped:
+                        print(f"\033[97m  {_stripped}\033[0m")
+                print()
+                # ── Speak the voiceover ──
+                _vo = _osint_voiceover(_narrative)
+                if _vo:
+                    if TTS_ENABLED:
+                        print(f"\033[90m[Speaking voiceover...]\033[0m")
+                        _speak_async(_vo)
+                    else:
+                        print(f"\033[90m[Tip: toggle /speak to hear the voiceover aloud]\033[0m\n")
+            except Exception as _e:
+                print(f"\033[91m  ⎿ Narration error: {_e}\033[0m\n")
+            continue
+
         # ── Context system commands ──
         if user_input.lower().startswith("mode:"):
             _explicit_mode = user_input.split("mode:", 1)[1].strip().lower()
@@ -1488,12 +1825,18 @@ while True:
         
         effective_mode = route_message(user_input) if current_mode == "auto" else current_mode
         if current_mode == "auto":
+            if effective_mode == "brain":
+                try:
+                    confirm = input(f"\033[90m  ⎿ [auto → brain: {MODELS['brain']['model']}]  use it? [y/N] \033[0m").strip().lower()
+                except EOFError:
+                    confirm = "n"
+                if confirm != "y":
+                    effective_mode = "talk"
             print(f"\033[90m  ⎿ [auto → {effective_mode}: {MODELS[effective_mode]['model']}]\033[0m")
 
-        _active_key = MODELS[effective_mode].get("key", "")
+        _active_key = MODELS[effective_mode].get("key", "") or MODELS.get("full", {}).get("key", "")
         if _active_key:
-            os.environ[f"{MODELS[effective_mode]['model'].split('/')[0].upper()}_API_KEY"] = _active_key
-            if effective_mode == "code": os.environ["GITHUB_API_KEY"] = _active_key
+            os.environ["OPENAI_API_KEY"] = _active_key
 
         while True:
             api_kwargs = {"model": MODELS[effective_mode]["model"], "messages": _trim_messages(messages)}
